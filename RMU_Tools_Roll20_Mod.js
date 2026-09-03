@@ -308,24 +308,24 @@ var RMUTools = RMUTools || (function () {
         body += `<div style="margin-top:6px;font-size:90%">Effect syntax: <code>+10 to db</code>, ` +
                 `<code>+10 to rr</code>, <code>+20 to fear rr</code>, or ` +
                 `<code>+10 to attr:perception_misc</code>.</div>`;
-        whisper(msg.who, card('RMU Buffs', body));
+        whisperPlayer(msg, card('RMU Buffs', body));
     }
 
     function handleBuff(msg, raw) {
         const ext = extractCharArg(raw), character = selectedCharacter(msg, ext.charId);
-        if (!character) { whisper(msg.who, card('RMU Buffs', 'Select a token representing a character, then try again.')); return; }
+        if (!character) { whisperPlayer(msg, card('RMU Buffs', 'Select a token representing a character, then try again.')); return; }
         const charId = character.id, cs = charState(charId), content = ext.content;
         let m;
 
         if ((m = content.match(/\s--add\s+([\s\S]+)$/))) {
             const spec = m[1], split = spec.indexOf('|');
-            if (split < 1) { whisper(msg.who, card('RMU Buffs', 'Use <code>--add Name|+10 to db, +10 to rr</code>.')); return; }
+            if (split < 1) { whisperPlayer(msg, card('RMU Buffs', 'Use <code>--add Name|+10 to db, +10 to rr</code>.')); return; }
             const name = spec.substring(0, split).trim(), effectText = spec.substring(split + 1).trim();
             const parsed = parseEffects(charId, effectText);
             if (!name || !parsed.effects.length || parsed.errors.length) {
                 let body = !name ? 'Buff name is missing.<br>' : '';
                 parsed.errors.forEach(e => body += `${html(e)}<br>`);
-                whisper(msg.who, card('RMU Buffs', body || 'No valid effects.')); return;
+                whisperPlayer(msg, card('RMU Buffs', body || 'No valid effects.')); return;
             }
             const id = Date.now().toString(36) + randomInteger(9999).toString(36);
             cs.buffs[id] = { id: id, name: name, effectText: effectText, effects: parsed.effects, active: true };
@@ -335,7 +335,7 @@ var RMUTools = RMUTools || (function () {
         const actionMatch = content.match(/\s--(toggle|on|off|del)\s+([A-Za-z0-9_-]+)/);
         if (actionMatch) {
             const action = actionMatch[1], id = actionMatch[2], buff = cs.buffs[id];
-            if (!buff) { whisper(msg.who, card('RMU Buffs', 'Buff not found.')); return; }
+            if (!buff) { whisperPlayer(msg, card('RMU Buffs', 'Buff not found.')); return; }
             if (action === 'toggle') buff.active = !buff.active;
             if (action === 'on') buff.active = true;
             if (action === 'off') buff.active = false;
@@ -397,7 +397,7 @@ var RMUTools = RMUTools || (function () {
         });
 
         charState(charId).lastExtraDie = { when: Date.now(), powerMin: pli.min, results: updates };
-        whisper(msg.who, card('RMU fourth stat die',
+        whisperPlayer(msg, card('RMU fourth stat die',
             `<div><b>${html(character.get('name'))}</b></div><div style="margin-top:5px">${results.join('<br>')}</div>` +
             `<div style="margin-top:6px;font-size:90%">This is a post-Charactermancer adjustment. ` +
             `It keeps any later absolute stat boosts already recorded by the official sheet.</div>`));
@@ -419,17 +419,17 @@ var RMUTools = RMUTools || (function () {
                 body += `<div>${button(stat.label, `!rmu-stats --char ${charId} --raise ${stat.name}`)} ${temp}/${pot}</div>`;
             });
         } else body += `<div style="margin-top:5px"><i>No extra average raises pending.</i></div>`;
-        whisper(msg.who, card('RMU raise to average', body));
+        whisperPlayer(msg, card('RMU raise to average', body));
     }
 
     function applyAverageRaise(msg, character, statName) {
         const charId = character.id, cs = charState(charId);
         if ((cs.pendingAverageRaises || 0) < 1) {
-            whisper(msg.who, card('RMU Stats', 'No extra average raises are pending. Use <code>!rmu-stats --average 2</code> first.'));
+            whisperPlayer(msg, card('RMU Stats', 'No extra average raises are pending. Use <code>!rmu-stats --average 2</code> first.'));
             return;
         }
         const stat = STAT_INFO.filter(s => s.name === statName.toLowerCase())[0];
-        if (!stat) { whisper(msg.who, card('RMU Stats', `Unknown stat "${html(statName)}".`)); return; }
+        if (!stat) { whisperPlayer(msg, card('RMU Stats', `Unknown stat "${html(statName)}".`)); return; }
 
         const pli = powerLevelInfo(charId), tempAttr = stat.name + '_misc', potAttr = stat.name + '_pot_misc';
         const oldTemp = currentStatValue(charId, stat.name), oldPot = currentPotValue(charId, stat.name);
@@ -439,14 +439,14 @@ var RMUTools = RMUTools || (function () {
         setAttr(charId, potAttr, miscSetAbsolute(getAttr(charId, potAttr, '[]'), 'RMU Mod: Raise to average', newPot), true);
         cs.pendingAverageRaises -= 1;
 
-        whisper(msg.who, card('RMU Stats', `${html(stat.label)} raised from ${oldTemp}/${oldPot} to ` +
+        whisperPlayer(msg, card('RMU Stats', `${html(stat.label)} raised from ${oldTemp}/${oldPot} to ` +
             `<b>${newTemp}/${newPot}</b>. ${cs.pendingAverageRaises} extra raise(s) remaining.`));
         if (cs.pendingAverageRaises > 0) averageRaiseMenu(msg, character);
     }
 
     function handleStats(msg, raw) {
         const ext = extractCharArg(raw), character = selectedCharacter(msg, ext.charId);
-        if (!character) { whisper(msg.who, card('RMU Stats', 'Select a token representing a character, then try again.')); return; }
+        if (!character) { whisperPlayer(msg, card('RMU Stats', 'Select a token representing a character, then try again.')); return; }
         const charId = character.id, content = ext.content;
         let m;
         if (/\s--extra\b/.test(content)) { applyExtraStatDie(msg, character); return; }
@@ -460,18 +460,18 @@ var RMUTools = RMUTools || (function () {
             `<div style="margin-top:5px">${button('Roll fourth die', `!rmu-stats --char ${charId} --extra`)}</div>` +
             `<div style="margin-top:4px">${button('Two extra raises to average', `!rmu-stats --char ${charId} --average 2`)}</div>` +
             `<div style="margin-top:6px;font-size:90%">Run these after the official Charactermancer has finished character creation.</div>`;
-        whisper(msg.who, card('RMU Stat House Rules', body));
+        whisperPlayer(msg, card('RMU Stat House Rules', body));
     }
 
     function mainMenu(msg) {
         const ext = extractCharArg(msg.content), character = selectedCharacter(msg, ext.charId);
         if (!character) {
-            whisper(msg.who, card('RMU Tools', 'Select a token representing an RMU character.<br><br>' +
+            whisperPlayer(msg, card('RMU Tools', 'Select a token representing an RMU character.<br><br>' +
                 '<code>!rmu-stats</code> — stat house rules<br><code>!rmu-buff</code> — custom buffs'));
             return;
         }
         const cid = character.id;
-        whisper(msg.who, card('RMU Tools', `<div><b>${html(character.get('name'))}</b></div>` +
+        whisperPlayer(msg, card('RMU Tools', `<div><b>${html(character.get('name'))}</b></div>` +
             `<div style="margin-top:5px">${button('Stat house rules', `!rmu-stats --char ${cid}`)}</div>` +
             `<div style="margin-top:4px">${button('Buff manager', `!rmu-buff --char ${cid} --menu`)}</div>`));
     }
