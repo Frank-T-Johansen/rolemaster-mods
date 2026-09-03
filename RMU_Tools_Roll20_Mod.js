@@ -109,9 +109,16 @@ var RMUTools = RMUTools || (function () {
             .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
-    function whisper(who, body) {
-        const target = String(who || 'gm').replace(/"/g, '');
-        sendChat(SCRIPT, `/w "${target}" ${body}`, null, { noarchive: true });
+    function whisperPlayer(msg, body) {
+        const player = getObj('player', msg.playerid);
+        const target = player ? player.get('_displayname') : 'gm';
+
+        sendChat(
+            SCRIPT,
+            `/w "${target.replace(/"/g, '')}" ${body}`,
+            null,
+            { noarchive: true }
+        );
     }
 
     function card(title, body) {
