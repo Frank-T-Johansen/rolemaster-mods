@@ -1,6 +1,6 @@
 /*
  * RMU Tools for Roll20
- * Version 0.3.0
+ * Version 0.3.1
  *
  * Designed for the official "Rolemaster Unified by Iron Crown Enterprises"
  * character sheet.
@@ -17,6 +17,10 @@
  *   The stat adjustment is therefore applied AFTER character creation.
  *   In the official Charactermancer, choose "Do Nothing" for the two stat
  *   boosts and for the two stat swaps. Then use this Mod afterwards.
+ *
+ * v0.3.1:
+ *   Fixes stat swaps: --swapsecond was accidentally being caught by the
+ *   --swaps command parser, resetting the swap workflow to two each time.
  *
  * Commands:
  *   !rmu
@@ -44,7 +48,7 @@ var RMUTools = RMUTools || (function () {
     'use strict';
 
     const SCRIPT = 'RMUTools';
-    const VERSION = '0.3.0';
+    const VERSION = '0.3.1';
     const STATE_VERSION = 1;
     const STATE_KEY = 'RMUTools';
     const BUFF_PREFIX = 'RMU Buff [';
@@ -753,7 +757,7 @@ var RMUTools = RMUTools || (function () {
         if (/\s--raise90\b/.test(content)) { applyFixedRaise(msg, character, 90); return; }
         if (/\s--raise85\b/.test(content)) { applyFixedRaise(msg, character, 85); return; }
 
-        if ((m = content.match(/\s--swaps(?:\s+(\d+))?/))) {
+        if ((m = content.match(/\s--swaps\b(?:\s+(\d+))?/))) {
             if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0) {
                 whisperPlayer(msg, card('RMU Stat Swaps',
                     `Finish your post-roll boosts first. Boosts remaining: <b>${cs.pendingBoosts || 0}</b>.`));
