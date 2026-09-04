@@ -1,24 +1,32 @@
 /*
  * RMU Tools for Roll20
- * Version 0.1.1
+ * Version 0.3.0
  *
  * Designed for the official "Rolemaster Unified by Iron Crown Enterprises"
  * character sheet.
  *
  * Features:
  *   1) Optional post-Charactermancer fourth stat die.
- *   2) Two (configurable) extra "raise to average" stat boosts.
- *   3) Pathfinder-like custom buffs managed from chat.
+ *   2) Post-roll stat boosts handled outside Charactermancer
+ *      (raise to average / 85 / 90).
+ *   3) Post-roll stat swaps handled after all boosts are complete.
+ *   4) Pathfinder-like custom buffs managed from chat.
  *
  * IMPORTANT:
  *   Roll20 Mods cannot execute inside the official Charactermancer sandbox.
  *   The stat adjustment is therefore applied AFTER character creation.
+ *   In the official Charactermancer, choose "Do Nothing" for the two stat
+ *   boosts and for the two stat swaps. Then use this Mod afterwards.
  *
  * Commands:
  *   !rmu
  *   !rmu-stats --extra
+ *   !rmu-stats --resetworkflow
  *   !rmu-stats --average 2
  *   !rmu-stats --raise agility
+ *   !rmu-stats --raise85
+ *   !rmu-stats --raise90
+ *   !rmu-stats --swaps 2
  *
  *   !rmu-buff --menu
  *   !rmu-buff --add Bless|+10 to db, +10 to rr
@@ -36,7 +44,7 @@ var RMUTools = RMUTools || (function () {
     'use strict';
 
     const SCRIPT = 'RMUTools';
-    const VERSION = '0.1.1';
+    const VERSION = '0.3.0';
     const STATE_VERSION = 1;
     const STATE_KEY = 'RMUTools';
     const BUFF_PREFIX = 'RMU Buff [';
@@ -106,7 +114,13 @@ var RMUTools = RMUTools || (function () {
             root.characters[charId] = {
                 buffs: {},
                 managedAttrs: [],
-                pendingAverageRaises: 0
+                pendingAverageRaises: 0,
+                pendingBoosts: 0,
+                pendingSwaps: 0,
+                pendingSwapFirst: null,
+                boostRankOrder: [],
+                usedRaise85: false,
+                usedRaise90: false
             };
         }
         return root.characters[charId];
@@ -464,21 +478,209 @@ var RMUTools = RMUTools || (function () {
             updates.push({ stat: stat.name, die: extra, changed: changed });
         });
 
-        charState(charId).lastExtraDie = { when: Date.now(), powerMin: pli.min, results: updates };
+        const cs = initializePostRollWorkflow(charId);
+        cs.lastExtraDie = { when: Date.now(), powerMin: pli.min, results: updates };
+
         whisperPlayer(msg, card('RMU fourth stat die',
             `<div><b>${html(character.get('name'))}</b></div><div style="margin-top:5px">${results.join('<br>')}</div>` +
-            `<div style="margin-top:6px;font-size:90%">This is a post-Charactermancer adjustment. ` +
-            `It keeps any later absolute stat boosts already recorded by the official sheet.</div>`));
+            `<div style="margin-top:6px;font-size:90%"><b>Workflow reset:</b> ` +
+            `you now have <b>${cs.pendingBoosts}</b> post-roll boost choices and ` +
+            `<b>${cs.pendingSwaps}</b> post-roll stat swaps remaining. ` +
+            `Complete your boosts first, then do your swaps at the end.</div>`));
     }
 
     function currentStatValue(charId, statName) { return miscTotal(getAttr(charId, statName + '_misc', '[]')); }
     function currentPotValue(charId, statName) { return miscTotal(getAttr(charId, statName + '_pot_misc', '[]')); }
 
+    function rankStatNamesByCreationTemp(charId) {
+        const indexMap = {};
+        STAT_INFO.forEach((s, idx) => { indexMap[s.name] = idx; });
+
+        return STAT_INFO.map(stat => {
+            const r = originalCreationRolls(charId, stat.name);
+            return {
+                name: stat.name,
+                temp: r ? r.temp : -999,
+                pot: r ? r.pot : -999
+            };
+        }).sort((a, b) => {
+            if (b.temp !== a.temp) return b.temp - a.temp;
+            if (b.pot !== a.pot) return b.pot - a.pot;
+            return indexMap[a.name] - indexMap[b.name];
+        }).map(r => r.name);
+    }
+
+    function initializePostRollWorkflow(charId) {
+        const cs = charState(charId);
+        cs.pendingBoosts = 2;
+        cs.pendingAverageRaises = 0;
+        cs.pendingSwaps = 2;
+        cs.pendingSwapFirst = null;
+        cs.usedRaise85 = false;
+        cs.usedRaise90 = false;
+        cs.boostRankOrder = rankStatNamesByCreationTemp(charId);
+        return cs;
+    }
+
+    function ensureBoostRankOrder(charId) {
+        const cs = charState(charId);
+        if (!Array.isArray(cs.boostRankOrder) || !cs.boostRankOrder.length) {
+            cs.boostRankOrder = rankStatNamesByCreationTemp(charId);
+        }
+        return cs.boostRankOrder;
+    }
+
+    function fixedRaiseTargetName(charId, target) {
+        const order = ensureBoostRankOrder(charId);
+        if (target === 90) return order[0] || null;
+        if (target === 85) return order[1] || null;
+        return null;
+    }
+
+    function requireBoostAvailable(msg, character) {
+        const cs = charState(character.id);
+        if ((cs.pendingBoosts || 0) < 1) {
+            whisperPlayer(msg, card('RMU Stats',
+                `No post-roll boost choices remain for <b>${html(character.get('name'))}</b>. ` +
+                `Use <code>!rmu-stats --resetworkflow</code> if you need to reinitialize the ` +
+                `post-roll workflow from the current creation stats.`));
+            return false;
+        }
+        return true;
+    }
+
+
+    function findStat(statName) {
+        const key = String(statName || '').toLowerCase();
+        return STAT_INFO.find(s => s.name === key || s.abbr === key) || null;
+    }
+
+    function setCreationPackage(charId, statName, temp, pot, note) {
+        const creation = originalCreationRolls(charId, statName);
+        if (!creation) return false;
+
+        const entry = creation.array[creation.index];
+        entry.name = `Temp ${temp}, Pot ${pot}${note ? ' (' + note + ')' : ''}`;
+        entry.absolute = temp;
+        delete entry.value;
+        setAttr(charId, statName + '_misc', JSON.stringify(creation.array), true);
+
+        const potAttr = statName + '_pot_misc';
+        setAttr(charId, potAttr,
+            miscSetNamedValue(getAttr(charId, potAttr, '[]'), 'Creation', pot), true);
+        return true;
+    }
+
+    function swapCreationStats(msg, character, statAName, statBName) {
+        const charId = character.id;
+        const a = findStat(statAName), b = findStat(statBName);
+        if (!a || !b || a.name === b.name) {
+            whisperPlayer(msg, card('RMU Stat Swap', 'Choose two different valid stats.'));
+            return false;
+        }
+
+        const av = originalCreationRolls(charId, a.name);
+        const bv = originalCreationRolls(charId, b.name);
+        if (!av || !bv) {
+            whisperPlayer(msg, card('RMU Stat Swap', 'Could not locate the original creation values for both stats.'));
+            return false;
+        }
+
+        // Swap only the creation Temp/Potential package. Racial bonuses,
+        // buffs, and other later misc entries stay attached to their stats.
+        setCreationPackage(charId, a.name, bv.temp, bv.pot, `swapped from ${b.label}`);
+        setCreationPackage(charId, b.name, av.temp, av.pot, `swapped from ${a.label}`);
+
+        whisperPlayer(msg, card('RMU Stat Swap',
+            `<b>${html(a.label)}</b> ${av.temp}/${av.pot} &harr; ` +
+            `<b>${html(b.label)}</b> ${bv.temp}/${bv.pot}`));
+        return true;
+    }
+
+    function swapMenu(msg, character) {
+        const charId = character.id, cs = charState(charId);
+        const remaining = cs.pendingSwaps || 0;
+        let body = `<div><b>${html(character.get('name'))}</b></div>` +
+                   `<div>Swaps remaining: <b>${remaining}</b></div>`;
+
+        if (remaining < 1) {
+            body += `<div style="margin-top:5px"><i>No stat swaps pending.</i></div>`;
+            whisperPlayer(msg, card('RMU Stat Swaps', body));
+            return;
+        }
+
+        if (!cs.pendingSwapFirst) {
+            body += `<div style="margin-top:5px">Choose the first stat:</div>`;
+            STAT_INFO.forEach(stat => {
+                const r = originalCreationRolls(charId, stat.name);
+                const values = r ? `${r.temp}/${r.pot}` : '?/?';
+                body += `<div>${button(stat.label, `!rmu-stats --char ${charId} --swapfirst ${stat.name}`)} ${values}</div>`;
+            });
+        } else {
+            const first = findStat(cs.pendingSwapFirst);
+            body += `<div style="margin-top:5px">Swap <b>${html(first ? first.label : cs.pendingSwapFirst)}</b> with:</div>`;
+            STAT_INFO.filter(stat => stat.name !== cs.pendingSwapFirst).forEach(stat => {
+                const r = originalCreationRolls(charId, stat.name);
+                const values = r ? `${r.temp}/${r.pot}` : '?/?';
+                body += `<div>${button(stat.label, `!rmu-stats --char ${charId} --swapsecond ${stat.name}`)} ${values}</div>`;
+            });
+            body += `<div style="margin-top:4px">${button('Cancel selection', `!rmu-stats --char ${charId} --swapcancel`)}</div>`;
+        }
+        whisperPlayer(msg, card('RMU Stat Swaps', body));
+    }
+
+    function applyFixedRaise(msg, character, target) {
+        const charId = character.id;
+        const cs = charState(charId);
+
+        if (!requireBoostAvailable(msg, character)) return;
+
+        if (target === 90 && cs.usedRaise90) {
+            whisperPlayer(msg, card('RMU Raise to 90',
+                'The post-roll <b>Raise to 90</b> option has already been used in this workflow.'));
+            return;
+        }
+        if (target === 85 && cs.usedRaise85) {
+            whisperPlayer(msg, card('RMU Raise to 85',
+                'The post-roll <b>Raise to 85</b> option has already been used in this workflow.'));
+            return;
+        }
+
+        const statName = fixedRaiseTargetName(charId, target);
+        const stat = findStat(statName);
+        if (!stat) {
+            whisperPlayer(msg, card(`RMU Raise to ${target}`,
+                'Could not determine the correct stat for this post-roll boost.'));
+            return;
+        }
+
+        const r = originalCreationRolls(charId, stat.name);
+        if (!r) {
+            whisperPlayer(msg, card(`RMU Raise to ${target}`,
+                'Could not locate the original creation values for that stat.'));
+            return;
+        }
+
+        const newTemp = Math.max(r.temp, target);
+        const newPot = Math.min(100, Math.max(r.pot + 10, newTemp));
+        setCreationPackage(charId, stat.name, newTemp, newPot, `raised to ${target}`);
+
+        cs.pendingBoosts = Math.max(0, (cs.pendingBoosts || 0) - 1);
+        if (target === 90) cs.usedRaise90 = true;
+        if (target === 85) cs.usedRaise85 = true;
+
+        whisperPlayer(msg, card(`RMU Raise to ${target}`,
+            `<b>${html(stat.label)}</b> was the locked post-roll target for Raise to ${target}.<br>` +
+            `It changed from ${r.temp}/${r.pot} to <b>${newTemp}/${newPot}</b>.<br>` +
+            `Post-roll boosts remaining: <b>${cs.pendingBoosts}</b>.`));
+    }
+
     function averageRaiseMenu(msg, character) {
         const charId = character.id, cs = charState(charId), pli = powerLevelInfo(charId);
         const remaining = cs.pendingAverageRaises || 0;
         let body = `<div><b>${html(character.get('name'))}</b></div>` +
-                   `<div>Raises remaining: <b>${remaining}</b></div>` +
+                   `<div>Average raises waiting to be assigned: <b>${remaining}</b></div>` +
+                   `<div>Total post-roll boosts remaining: <b>${cs.pendingBoosts || 0}</b></div>` +
                    `<div>Average: Temp ${pli.temp}, Pot ${pli.pot}</div>`;
         if (remaining > 0) {
             body += `<div style="margin-top:5px">Choose a stat:</div>`;
@@ -486,16 +688,18 @@ var RMUTools = RMUTools || (function () {
                 const temp = currentStatValue(charId, stat.name), pot = currentPotValue(charId, stat.name);
                 body += `<div>${button(stat.label, `!rmu-stats --char ${charId} --raise ${stat.name}`)} ${temp}/${pot}</div>`;
             });
-        } else body += `<div style="margin-top:5px"><i>No extra average raises pending.</i></div>`;
+        } else body += `<div style="margin-top:5px"><i>No average raises pending.</i></div>`;
         whisperPlayer(msg, card('RMU raise to average', body));
     }
 
     function applyAverageRaise(msg, character, statName) {
         const charId = character.id, cs = charState(charId);
         if ((cs.pendingAverageRaises || 0) < 1) {
-            whisperPlayer(msg, card('RMU Stats', 'No extra average raises are pending. Use <code>!rmu-stats --average 2</code> first.'));
+            whisperPlayer(msg, card('RMU Stats', 'No average raises are pending. Use <code>!rmu-stats --average 1</code> or <code>--average 2</code> first.'));
             return;
         }
+        if (!requireBoostAvailable(msg, character)) return;
+
         const stat = STAT_INFO.filter(s => s.name === statName.toLowerCase())[0];
         if (!stat) { whisperPlayer(msg, card('RMU Stats', `Unknown stat "${html(statName)}".`)); return; }
 
@@ -505,29 +709,119 @@ var RMUTools = RMUTools || (function () {
 
         setAttr(charId, tempAttr, miscSetAbsolute(getAttr(charId, tempAttr, '[]'), 'RMU Mod: Raise to average', newTemp), true);
         setAttr(charId, potAttr, miscSetAbsolute(getAttr(charId, potAttr, '[]'), 'RMU Mod: Raise to average', newPot), true);
-        cs.pendingAverageRaises -= 1;
+
+        cs.pendingAverageRaises = Math.max(0, (cs.pendingAverageRaises || 0) - 1);
+        cs.pendingBoosts = Math.max(0, (cs.pendingBoosts || 0) - 1);
 
         whisperPlayer(msg, card('RMU Stats', `${html(stat.label)} raised from ${oldTemp}/${oldPot} to ` +
-            `<b>${newTemp}/${newPot}</b>. ${cs.pendingAverageRaises} extra raise(s) remaining.`));
+            `<b>${newTemp}/${newPot}</b>. Average raises waiting: <b>${cs.pendingAverageRaises}</b>. ` +
+            `Post-roll boosts remaining: <b>${cs.pendingBoosts}</b>.`));
         if (cs.pendingAverageRaises > 0) averageRaiseMenu(msg, character);
     }
 
     function handleStats(msg, raw) {
         const ext = extractCharArg(raw), character = selectedCharacter(msg, ext.charId);
         if (!character) { whisperPlayer(msg, card('RMU Stats', 'Select a token representing a character, then try again.')); return; }
-        const charId = character.id, content = ext.content;
+        const charId = character.id, content = ext.content, cs = charState(charId);
         let m;
+
         if (/\s--extra\b/.test(content)) { applyExtraStatDie(msg, character); return; }
+
+        if (/\s--resetworkflow\b/.test(content)) {
+            initializePostRollWorkflow(charId);
+            whisperPlayer(msg, card('RMU Stat Workflow',
+                `<div><b>${html(character.get('name'))}</b></div>` +
+                `<div>Post-roll workflow reset from the current creation stats.</div>` +
+                `<div>You now have <b>2</b> boost choices and <b>2</b> stat swaps remaining.</div>` +
+                `<div style="margin-top:5px;font-size:90%">Recommended order: ignore the two boosts and two swaps in the official Charactermancer, roll the fourth die here, spend your two boosts here, and only then do your two swaps.</div>`));
+            return;
+        }
+
         if ((m = content.match(/\s--average(?:\s+(\d+))?/))) {
-            charState(charId).pendingAverageRaises = Math.max(1, Math.min(10, parseInt(m[1] || '2', 10)));
+            if (!requireBoostAvailable(msg, character)) return;
+            const requested = Math.max(1, Math.min(10, parseInt(m[1] || '1', 10)));
+            const allowed = Math.min(requested, cs.pendingBoosts || 0);
+            if (allowed < 1) {
+                whisperPlayer(msg, card('RMU Stats', 'No post-roll boosts remain.'));
+                return;
+            }
+            cs.pendingAverageRaises = allowed;
             averageRaiseMenu(msg, character); return;
         }
         if ((m = content.match(/\s--raise\s+([A-Za-z-]+)/))) { applyAverageRaise(msg, character, m[1]); return; }
 
+        if (/\s--raise90\b/.test(content)) { applyFixedRaise(msg, character, 90); return; }
+        if (/\s--raise85\b/.test(content)) { applyFixedRaise(msg, character, 85); return; }
+
+        if ((m = content.match(/\s--swaps(?:\s+(\d+))?/))) {
+            if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0) {
+                whisperPlayer(msg, card('RMU Stat Swaps',
+                    `Finish your post-roll boosts first. Boosts remaining: <b>${cs.pendingBoosts || 0}</b>.`));
+                return;
+            }
+            cs.pendingSwaps = Math.max(1, Math.min(10, parseInt(m[1] || String(cs.pendingSwaps || 2), 10)));
+            cs.pendingSwapFirst = null;
+            swapMenu(msg, character); return;
+        }
+        if ((m = content.match(/\s--swapfirst\s+([A-Za-z-]+)/))) {
+            if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0) {
+                whisperPlayer(msg, card('RMU Stat Swaps',
+                    `Finish your post-roll boosts first. Boosts remaining: <b>${cs.pendingBoosts || 0}</b>.`));
+                return;
+            }
+            if ((cs.pendingSwaps || 0) < 1) cs.pendingSwaps = 2;
+            const stat = findStat(m[1]);
+            if (!stat) { whisperPlayer(msg, card('RMU Stat Swap', 'Unknown stat.')); return; }
+            cs.pendingSwapFirst = stat.name;
+            swapMenu(msg, character); return;
+        }
+        if ((m = content.match(/\s--swapsecond\s+([A-Za-z-]+)/))) {
+            if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0) {
+                whisperPlayer(msg, card('RMU Stat Swaps',
+                    `Finish your post-roll boosts first. Boosts remaining: <b>${cs.pendingBoosts || 0}</b>.`));
+                return;
+            }
+            if (!cs.pendingSwapFirst) { swapMenu(msg, character); return; }
+            const first = cs.pendingSwapFirst;
+            cs.pendingSwapFirst = null;
+            if (swapCreationStats(msg, character, first, m[1])) cs.pendingSwaps = Math.max(0, (cs.pendingSwaps || 1) - 1);
+            if (cs.pendingSwaps > 0) swapMenu(msg, character);
+            return;
+        }
+        if (/\s--swapcancel\b/.test(content)) {
+            cs.pendingSwapFirst = null;
+            swapMenu(msg, character); return;
+        }
+
+        const highestName = fixedRaiseTargetName(charId, 90);
+        const secondName = fixedRaiseTargetName(charId, 85);
+        const highest = highestName ? findStat(highestName) : null;
+        const second = secondName ? findStat(secondName) : null;
+        const highestVals = highest ? originalCreationRolls(charId, highest.name) : null;
+        const secondVals = second ? originalCreationRolls(charId, second.name) : null;
+
         const body = `<div><b>${html(character.get('name'))}</b></div>` +
-            `<div style="margin-top:5px">${button('Roll fourth die', `!rmu-stats --char ${charId} --extra`)}</div>` +
-            `<div style="margin-top:4px">${button('Two extra raises to average', `!rmu-stats --char ${charId} --average 2`)}</div>` +
-            `<div style="margin-top:6px;font-size:90%">Run these after the official Charactermancer has finished character creation.</div>`;
+            `<div style="margin-top:4px"><b>Important:</b> in the official Charactermancer, choose ` +
+            `<b>Do Nothing</b> for the two stat boosts and for the two stat swaps.</div>` +
+            `<div style="margin-top:5px"><b>Workflow</b></div>` +
+            `<div>1. Roll the fourth die</div>` +
+            `<div>2. Spend your 2 post-roll boosts</div>` +
+            `<div>3. Perform your 2 post-roll swaps at the end</div>` +
+            `<div style="margin-top:6px">Post-roll boosts remaining: <b>${cs.pendingBoosts || 0}</b></div>` +
+            `<div>Post-roll swaps remaining: <b>${cs.pendingSwaps || 0}</b></div>` +
+            `<div style="margin-top:6px">${button('Reset workflow (2 boosts, 2 swaps)', `!rmu-stats --char ${charId} --resetworkflow`)}</div>` +
+            `<div style="margin-top:4px">${button('1. Roll fourth die', `!rmu-stats --char ${charId} --extra`)}</div>` +
+            `<div style="margin-top:6px"><b>Boosts</b></div>` +
+            `<div>${button('Raise to average', `!rmu-stats --char ${charId} --average 1`)} ` +
+            `${button('Two average raises', `!rmu-stats --char ${charId} --average 2`)}</div>` +
+            `<div style="margin-top:4px">${button('Raise highest temp to 90', `!rmu-stats --char ${charId} --raise90`)}` +
+            `${highest ? ` &mdash; ${html(highest.label)} ${highestVals ? highestVals.temp + '/' + highestVals.pot : ''}` : ''}</div>` +
+            `<div style="margin-top:4px">${button('Raise second-highest temp to 85', `!rmu-stats --char ${charId} --raise85`)}` +
+            `${second ? ` &mdash; ${html(second.label)} ${secondVals ? secondVals.temp + '/' + secondVals.pot : ''}` : ''}</div>` +
+            `<div style="margin-top:6px"><b>Swaps (after boosts)</b></div>` +
+            `<div>${button('Two stat swaps', `!rmu-stats --char ${charId} --swaps 2`)}</div>` +
+            `<div style="margin-top:6px;font-size:90%">The 85/90 buttons follow the locked post-roll ranking ` +
+            `of your creation stats, so they are not affected by the order in which you click them later.</div>`;
         whisperPlayer(msg, card('RMU Stat House Rules', body));
     }
 
