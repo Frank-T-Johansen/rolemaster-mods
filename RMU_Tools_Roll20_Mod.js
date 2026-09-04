@@ -1,6 +1,6 @@
 /*
  * RMU Tools for Roll20
- * Version 0.3.1
+ * Version 0.4.1
  *
  * Designed for the official "Rolemaster Unified by Iron Crown Enterprises"
  * character sheet.
@@ -18,15 +18,31 @@
  *   In the official Charactermancer, choose "Do Nothing" for the two stat
  *   boosts and for the two stat swaps. Then use this Mod afterwards.
  *
+ * v0.4.1:
+ *   Adds the campaign house rule granting three EXTRA Raise-to-Average
+ *   boosts (Temp 56 / Pot 78 at Superior), separate from the two normal
+ *   RMU post-roll boost choices.
+ *
+ * v0.4.0:
+ *   Automatically removes the mandatory Charactermancer stat-boost effects
+ *   before the fourth-die house rule is applied. The original Temp/Pot rolls
+ *   are reconstructed from the preserved "Temp N, Pot N" creation-history
+ *   entry. Supports the official Charactermancer's Raise to Average,
+ *   Raise to 85, Raise to 90, and Creation Stat Gain history entries.
+ *
  * v0.3.1:
  *   Fixes stat swaps: --swapsecond was accidentally being caught by the
  *   --swaps command parser, resetting the swap workflow to two each time.
  *
  * Commands:
  *   !rmu
+ *   !rmu-stats --prepare
  *   !rmu-stats --extra
+ *   !rmu-stats --undo-cm-boosts
  *   !rmu-stats --resetworkflow
  *   !rmu-stats --average 2
+ *   !rmu-stats --houseaverage 3
+ *   !rmu-stats --houseraise agility
  *   !rmu-stats --raise agility
  *   !rmu-stats --raise85
  *   !rmu-stats --raise90
@@ -48,7 +64,7 @@ var RMUTools = RMUTools || (function () {
     'use strict';
 
     const SCRIPT = 'RMUTools';
-    const VERSION = '0.3.1';
+    const VERSION = '0.4.1';
     const STATE_VERSION = 1;
     const STATE_KEY = 'RMUTools';
     const BUFF_PREFIX = 'RMU Buff [';
@@ -119,6 +135,8 @@ var RMUTools = RMUTools || (function () {
                 buffs: {},
                 managedAttrs: [],
                 pendingAverageRaises: 0,
+                pendingHouseAverageRaises: 0,
+                houseAverageRaisesRemaining: 0,
                 pendingBoosts: 0,
                 pendingSwaps: 0,
                 pendingSwapFirst: null,
@@ -455,8 +473,98 @@ var RMUTools = RMUTools || (function () {
         return null;
     }
 
+    function isCharactermancerStatBoostEntry(entry) {
+        if (!entry || typeof entry.name !== 'string') return false;
+        return /^Raise to average \(Pot \d+\)$/i.test(entry.name) ||
+               /^Raise highest to (?:85|90) \(Pot \d+\)$/i.test(entry.name) ||
+               /^Creation stat gain - \d+ [AB]$/i.test(entry.name);
+    }
+
+    function undoCharactermancerStatBoosts(msg, character, quiet) {
+        const charId = character.id;
+        const results = [];
+        let changedStats = 0;
+        let removedEntries = 0;
+
+        STAT_INFO.forEach(stat => {
+            const tempAttr = stat.name + '_misc';
+            const potAttr = stat.name + '_pot_misc';
+            const arr = safeMiscParse(getAttr(charId, tempAttr, '[]'));
+
+            // createStatsFinalize() always writes the untouched rolled pair
+            // first as "Temp N, Pot N". Later mandatory Charactermancer boost
+            // choices append their own history entries. Even when Potential
+            // is subsequently overwritten, the original Pot survives here.
+            let original = null;
+            for (let i = 0; i < arr.length; i++) {
+                const o = arr[i];
+                if (!o || typeof o.name !== 'string') continue;
+                const m = o.name.match(/^Temp\s+(\d+),\s*Pot\s+(\d+)/i);
+                if (m) {
+                    original = {
+                        temp: parseInt(m[1], 10),
+                        pot: parseInt(m[2], 10)
+                    };
+                    break;
+                }
+            }
+
+            if (!original) {
+                results.push(`${stat.label}: original Temp/Pot history not found`);
+                return;
+            }
+
+            const beforeCount = arr.length;
+            const cleaned = arr.filter(o => !isCharactermancerStatBoostEntry(o));
+            const removed = beforeCount - cleaned.length;
+
+            // Restore the Potential Creation entry even if the only CM boost
+            // affected Potential and no Temp-history entry remains after a
+            // previous manual cleanup.
+            const oldPot = miscTotal(getAttr(charId, potAttr, '[]'));
+            const oldTemp = miscTotal(getAttr(charId, tempAttr, '[]'));
+
+            if (removed > 0 || oldPot !== original.pot) {
+                setAttr(charId, tempAttr, JSON.stringify(cleaned), true);
+                setAttr(
+                    charId,
+                    potAttr,
+                    miscSetNamedValue(getAttr(charId, potAttr, '[]'), 'Creation', original.pot),
+                    true
+                );
+                changedStats += 1;
+                removedEntries += removed;
+                results.push(`${stat.label}: restored creation ${original.temp}/${original.pot}` +
+                             `${removed ? `; removed ${removed} CM boost entr${removed === 1 ? 'y' : 'ies'}` : ''}`);
+            }
+        });
+
+        const cs = charState(charId);
+        cs.lastCMUndo = {
+            when: Date.now(),
+            changedStats: changedStats,
+            removedEntries: removedEntries
+        };
+
+        if (!quiet) {
+            const body = `<div><b>${html(character.get('name'))}</b></div>` +
+                `<div style="margin-top:5px">Restored <b>${changedStats}</b> stat(s) to their original ` +
+                `Charactermancer creation rolls and removed <b>${removedEntries}</b> mandatory boost-history entr${removedEntries === 1 ? 'y' : 'ies'}.</div>` +
+                `<div style="margin-top:5px;font-size:90%">Recognized Charactermancer entries: Raise to Average, Raise to 85, Raise to 90, and Creation Stat Gain.</div>` +
+                (results.length ? `<div style="margin-top:5px">${results.join('<br>')}</div>` : '');
+            whisperPlayer(msg, card('RMU undo Charactermancer boosts', body));
+        }
+
+        return {
+            changedStats: changedStats,
+            removedEntries: removedEntries,
+            results: results
+        };
+    }
+
     function applyExtraStatDie(msg, character) {
         const charId = character.id, pli = powerLevelInfo(charId), results = [], updates = [];
+        const undo = undoCharactermancerStatBoosts(msg, character, true);
         STAT_INFO.forEach(stat => {
             const original = originalCreationRolls(charId, stat.name);
             if (!original) { results.push(`${stat.label}: could not find original creation roll`); return; }
@@ -486,11 +594,14 @@ var RMUTools = RMUTools || (function () {
         cs.lastExtraDie = { when: Date.now(), powerMin: pli.min, results: updates };
 
         whisperPlayer(msg, card('RMU fourth stat die',
-            `<div><b>${html(character.get('name'))}</b></div><div style="margin-top:5px">${results.join('<br>')}</div>` +
+            `<div><b>${html(character.get('name'))}</b></div>` +
+            `<div style="margin-top:5px"><b>Before rolling:</b> restored ${undo.changedStats} stat(s) and removed ${undo.removedEntries} Charactermancer boost-history entr${undo.removedEntries === 1 ? 'y' : 'ies'}.</div>` +
+            `<div style="margin-top:5px">${results.join('<br>')}</div>` +
             `<div style="margin-top:6px;font-size:90%"><b>Workflow reset:</b> ` +
-            `you now have <b>${cs.pendingBoosts}</b> post-roll boost choices and ` +
+            `you now have <b>${cs.pendingBoosts}</b> normal post-roll boost choices, ` +
+            `<b>${cs.houseAverageRaisesRemaining}</b> extra house-rule Raise-to-Average boosts, and ` +
             `<b>${cs.pendingSwaps}</b> post-roll stat swaps remaining. ` +
-            `Complete your boosts first, then do your swaps at the end.</div>`));
+            `Complete all boosts first, then do your swaps at the end.</div>`));
     }
 
     function currentStatValue(charId, statName) { return miscTotal(getAttr(charId, statName + '_misc', '[]')); }
@@ -518,6 +629,8 @@ var RMUTools = RMUTools || (function () {
         const cs = charState(charId);
         cs.pendingBoosts = 2;
         cs.pendingAverageRaises = 0;
+        cs.houseAverageRaisesRemaining = 3;
+        cs.pendingHouseAverageRaises = 0;
         cs.pendingSwaps = 2;
         cs.pendingSwapFirst = null;
         cs.usedRaise85 = false;
@@ -723,11 +836,88 @@ var RMUTools = RMUTools || (function () {
         if (cs.pendingAverageRaises > 0) averageRaiseMenu(msg, character);
     }
 
+    function houseAverageRaiseMenu(msg, character) {
+        const charId = character.id, cs = charState(charId), pli = powerLevelInfo(charId);
+        const pending = cs.pendingHouseAverageRaises || 0;
+        let body = `<div><b>${html(character.get('name'))}</b></div>` +
+                   `<div>House-rule average raises waiting to be assigned: <b>${pending}</b></div>` +
+                   `<div>Total house-rule average raises remaining: <b>${cs.houseAverageRaisesRemaining || 0}</b></div>` +
+                   `<div>Average: Temp ${pli.temp}, Pot ${pli.pot}</div>`;
+        if (pending > 0) {
+            body += `<div style="margin-top:5px">Choose a stat:</div>`;
+            STAT_INFO.forEach(stat => {
+                const temp = currentStatValue(charId, stat.name), pot = currentPotValue(charId, stat.name);
+                body += `<div>${button(stat.label, `!rmu-stats --char ${charId} --houseraise ${stat.name}`)} ${temp}/${pot}</div>`;
+            });
+        } else {
+            body += `<div style="margin-top:5px"><i>No house-rule average raises are pending.</i></div>`;
+        }
+        whisperPlayer(msg, card('RMU house-rule Raise to Average', body));
+    }
+
+    function applyHouseAverageRaise(msg, character, statName) {
+        const charId = character.id, cs = charState(charId);
+        if ((cs.pendingHouseAverageRaises || 0) < 1 || (cs.houseAverageRaisesRemaining || 0) < 1) {
+            whisperPlayer(msg, card('RMU Stats',
+                'No house-rule Raise-to-Average boosts are pending. Use <code>!rmu-stats --houseaverage 3</code> first.'));
+            return;
+        }
+
+        const stat = STAT_INFO.filter(s => s.name === statName.toLowerCase())[0];
+        if (!stat) {
+            whisperPlayer(msg, card('RMU Stats', `Unknown stat "${html(statName)}".`));
+            return;
+        }
+
+        const pli = powerLevelInfo(charId);
+        const tempAttr = stat.name + '_misc', potAttr = stat.name + '_pot_misc';
+        const oldTemp = currentStatValue(charId, stat.name), oldPot = currentPotValue(charId, stat.name);
+        const newTemp = Math.max(oldTemp, pli.temp), newPot = Math.max(oldPot, pli.pot);
+
+        setAttr(
+            charId,
+            tempAttr,
+            miscSetAbsolute(getAttr(charId, tempAttr, '[]'), 'RMU Mod: House Raise to average', newTemp),
+            true
+        );
+        setAttr(
+            charId,
+            potAttr,
+            miscSetAbsolute(getAttr(charId, potAttr, '[]'), 'RMU Mod: House Raise to average', newPot),
+            true
+        );
+
+        cs.pendingHouseAverageRaises = Math.max(0, (cs.pendingHouseAverageRaises || 0) - 1);
+        cs.houseAverageRaisesRemaining = Math.max(0, (cs.houseAverageRaisesRemaining || 0) - 1);
+
+        whisperPlayer(msg, card('RMU house-rule Raise to Average',
+            `${html(stat.label)} raised from ${oldTemp}/${oldPot} to <b>${newTemp}/${newPot}</b>.<br>` +
+            `House-rule average raises remaining: <b>${cs.houseAverageRaisesRemaining}</b>.`));
+
+        if (cs.pendingHouseAverageRaises > 0) houseAverageRaiseMenu(msg, character);
+    }
+
     function handleStats(msg, raw) {
         const ext = extractCharArg(raw), character = selectedCharacter(msg, ext.charId);
         if (!character) { whisperPlayer(msg, card('RMU Stats', 'Select a token representing a character, then try again.')); return; }
         const charId = character.id, content = ext.content, cs = charState(charId);
         let m;
+
+        if (/\s--undo-cm-boosts\b/.test(content)) {
+            undoCharactermancerStatBoosts(msg, character, false);
+            return;
+        }
+
+        if (/\s--prepare\b/.test(content)) {
+            const undo = undoCharactermancerStatBoosts(msg, character, true);
+            initializePostRollWorkflow(charId);
+            whisperPlayer(msg, card('RMU Stat Preparation',
+                `<div><b>${html(character.get('name'))}</b></div>` +
+                `<div>Removed <b>${undo.removedEntries}</b> Charactermancer mandatory boost-history entr${undo.removedEntries === 1 ? 'y' : 'ies'} and restored the original creation Potential values.</div>` +
+                `<div style="margin-top:5px">The character is now ready for the fourth die.</div>` +
+                `<div style="margin-top:5px">${button('Roll fourth die', `!rmu-stats --char ${charId} --extra`)}</div>`));
+            return;
+        }
 
         if (/\s--extra\b/.test(content)) { applyExtraStatDie(msg, character); return; }
 
@@ -736,8 +926,8 @@ var RMUTools = RMUTools || (function () {
             whisperPlayer(msg, card('RMU Stat Workflow',
                 `<div><b>${html(character.get('name'))}</b></div>` +
                 `<div>Post-roll workflow reset from the current creation stats.</div>` +
-                `<div>You now have <b>2</b> boost choices and <b>2</b> stat swaps remaining.</div>` +
-                `<div style="margin-top:5px;font-size:90%">Recommended order: ignore the two boosts and two swaps in the official Charactermancer, roll the fourth die here, spend your two boosts here, and only then do your two swaps.</div>`));
+                `<div>You now have <b>2</b> normal boost choices, <b>3</b> extra house-rule Raise-to-Average boosts, and <b>2</b> stat swaps remaining.</div>` +
+                `<div style="margin-top:5px;font-size:90%">This button resets only RMU Tools counters and the locked 85/90 ranking. It does not undo stat values. Normally use the fourth-die button, which automatically removes mandatory Charactermancer boost effects first.</div>`));
             return;
         }
 
@@ -754,13 +944,31 @@ var RMUTools = RMUTools || (function () {
         }
         if ((m = content.match(/\s--raise\s+([A-Za-z-]+)/))) { applyAverageRaise(msg, character, m[1]); return; }
 
+        if ((m = content.match(/\s--houseaverage(?:\s+(\d+))?/))) {
+            const available = cs.houseAverageRaisesRemaining || 0;
+            if (available < 1) {
+                whisperPlayer(msg, card('RMU Stats', 'No extra house-rule Raise-to-Average boosts remain.'));
+                return;
+            }
+            const requested = Math.max(1, Math.min(3, parseInt(m[1] || String(available), 10)));
+            cs.pendingHouseAverageRaises = Math.min(requested, available);
+            houseAverageRaiseMenu(msg, character);
+            return;
+        }
+        if ((m = content.match(/\s--houseraise\s+([A-Za-z-]+)/))) {
+            applyHouseAverageRaise(msg, character, m[1]);
+            return;
+        }
+
         if (/\s--raise90\b/.test(content)) { applyFixedRaise(msg, character, 90); return; }
         if (/\s--raise85\b/.test(content)) { applyFixedRaise(msg, character, 85); return; }
 
         if ((m = content.match(/\s--swaps\b(?:\s+(\d+))?/))) {
-            if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0) {
+            if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0 ||
+                (cs.houseAverageRaisesRemaining || 0) > 0 || (cs.pendingHouseAverageRaises || 0) > 0) {
                 whisperPlayer(msg, card('RMU Stat Swaps',
-                    `Finish your post-roll boosts first. Boosts remaining: <b>${cs.pendingBoosts || 0}</b>.`));
+                    `Finish all post-roll boosts first. Normal boosts remaining: <b>${cs.pendingBoosts || 0}</b>; ` +
+                    `house-rule average boosts remaining: <b>${cs.houseAverageRaisesRemaining || 0}</b>.`));
                 return;
             }
             cs.pendingSwaps = Math.max(1, Math.min(10, parseInt(m[1] || String(cs.pendingSwaps || 2), 10)));
@@ -768,9 +976,11 @@ var RMUTools = RMUTools || (function () {
             swapMenu(msg, character); return;
         }
         if ((m = content.match(/\s--swapfirst\s+([A-Za-z-]+)/))) {
-            if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0) {
+            if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0 ||
+                (cs.houseAverageRaisesRemaining || 0) > 0 || (cs.pendingHouseAverageRaises || 0) > 0) {
                 whisperPlayer(msg, card('RMU Stat Swaps',
-                    `Finish your post-roll boosts first. Boosts remaining: <b>${cs.pendingBoosts || 0}</b>.`));
+                    `Finish all post-roll boosts first. Normal boosts remaining: <b>${cs.pendingBoosts || 0}</b>; ` +
+                    `house-rule average boosts remaining: <b>${cs.houseAverageRaisesRemaining || 0}</b>.`));
                 return;
             }
             if ((cs.pendingSwaps || 0) < 1) cs.pendingSwaps = 2;
@@ -780,9 +990,11 @@ var RMUTools = RMUTools || (function () {
             swapMenu(msg, character); return;
         }
         if ((m = content.match(/\s--swapsecond\s+([A-Za-z-]+)/))) {
-            if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0) {
+            if ((cs.pendingBoosts || 0) > 0 || (cs.pendingAverageRaises || 0) > 0 ||
+                (cs.houseAverageRaisesRemaining || 0) > 0 || (cs.pendingHouseAverageRaises || 0) > 0) {
                 whisperPlayer(msg, card('RMU Stat Swaps',
-                    `Finish your post-roll boosts first. Boosts remaining: <b>${cs.pendingBoosts || 0}</b>.`));
+                    `Finish all post-roll boosts first. Normal boosts remaining: <b>${cs.pendingBoosts || 0}</b>; ` +
+                    `house-rule average boosts remaining: <b>${cs.houseAverageRaisesRemaining || 0}</b>.`));
                 return;
             }
             if (!cs.pendingSwapFirst) { swapMenu(msg, character); return; }
@@ -805,24 +1017,29 @@ var RMUTools = RMUTools || (function () {
         const secondVals = second ? originalCreationRolls(charId, second.name) : null;
 
         const body = `<div><b>${html(character.get('name'))}</b></div>` +
-            `<div style="margin-top:4px"><b>Important:</b> in the official Charactermancer, choose ` +
-            `<b>Do Nothing</b> for the two stat boosts and for the two stat swaps.</div>` +
+            `<div style="margin-top:4px"><b>Important:</b> the official Charactermancer requires two stat-boost choices. Choose any legal options there, but leave both stat swaps as <b>No swap</b>. ` +
+            `RMU Tools automatically removes the Charactermancer boost effects before applying the fourth die.</div>` +
             `<div style="margin-top:5px"><b>Workflow</b></div>` +
-            `<div>1. Roll the fourth die</div>` +
+            `<div>1. Undo mandatory Charactermancer boosts and roll the fourth die</div>` +
             `<div>2. Spend your 2 post-roll boosts</div>` +
             `<div>3. Perform your 2 post-roll swaps at the end</div>` +
-            `<div style="margin-top:6px">Post-roll boosts remaining: <b>${cs.pendingBoosts || 0}</b></div>` +
+            `<div style="margin-top:6px">Normal post-roll boosts remaining: <b>${cs.pendingBoosts || 0}</b></div>` +
+            `<div>Extra house-rule Raise-to-Average boosts remaining: <b>${cs.houseAverageRaisesRemaining || 0}</b></div>` +
             `<div>Post-roll swaps remaining: <b>${cs.pendingSwaps || 0}</b></div>` +
-            `<div style="margin-top:6px">${button('Reset workflow (2 boosts, 2 swaps)', `!rmu-stats --char ${charId} --resetworkflow`)}</div>` +
-            `<div style="margin-top:4px">${button('1. Roll fourth die', `!rmu-stats --char ${charId} --extra`)}</div>` +
-            `<div style="margin-top:6px"><b>Boosts</b></div>` +
+            `<div style="margin-top:6px">${button('Prepare: undo Charactermancer boosts', `!rmu-stats --char ${charId} --prepare`)}</div>` +
+            `<div style="margin-top:4px">${button('1. Undo boosts + roll fourth die', `!rmu-stats --char ${charId} --extra`)}</div>` +
+            `<div style="margin-top:4px">${button('Reset counters/ranking only', `!rmu-stats --char ${charId} --resetworkflow`)}</div>` +
+            `<div style="margin-top:6px"><b>Normal RMU boosts (2 choices)</b></div>` +
             `<div>${button('Raise to average', `!rmu-stats --char ${charId} --average 1`)} ` +
-            `${button('Two average raises', `!rmu-stats --char ${charId} --average 2`)}</div>` +
+            `${button('Two normal average raises', `!rmu-stats --char ${charId} --average 2`)}</div>` +
             `<div style="margin-top:4px">${button('Raise highest temp to 90', `!rmu-stats --char ${charId} --raise90`)}` +
             `${highest ? ` &mdash; ${html(highest.label)} ${highestVals ? highestVals.temp + '/' + highestVals.pot : ''}` : ''}</div>` +
             `<div style="margin-top:4px">${button('Raise second-highest temp to 85', `!rmu-stats --char ${charId} --raise85`)}` +
             `${second ? ` &mdash; ${html(second.label)} ${secondVals ? secondVals.temp + '/' + secondVals.pot : ''}` : ''}</div>` +
-            `<div style="margin-top:6px"><b>Swaps (after boosts)</b></div>` +
+            `<div style="margin-top:6px"><b>House rule: 3 extra Raise-to-Average boosts</b></div>` +
+            `<div>${button('Use house-rule average boosts', `!rmu-stats --char ${charId} --houseaverage ${cs.houseAverageRaisesRemaining || 3}`)}</div>` +
+            `<div style="font-size:90%">At Superior these raise any chosen stat to at least Temp 56 / Pot 78. They are separate from the two normal RMU boost choices.</div>` +
+            `<div style="margin-top:6px"><b>Swaps (after all boosts)</b></div>` +
             `<div>${button('Two stat swaps', `!rmu-stats --char ${charId} --swaps 2`)}</div>` +
             `<div style="margin-top:6px;font-size:90%">The 85/90 buttons follow the locked post-roll ranking ` +
             `of your creation stats, so they are not affected by the order in which you click them later.</div>`;
