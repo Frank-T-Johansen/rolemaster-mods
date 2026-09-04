@@ -1,6 +1,6 @@
 /*
  * RMU Tools for Roll20
- * Version 0.1.0
+ * Version 0.1.1
  *
  * Designed for the official "Rolemaster Unified by Iron Crown Enterprises"
  * character sheet.
@@ -36,7 +36,7 @@ var RMUTools = RMUTools || (function () {
     'use strict';
 
     const SCRIPT = 'RMUTools';
-    const VERSION = '0.1.0';
+    const VERSION = '0.1.1';
     const STATE_VERSION = 1;
     const STATE_KEY = 'RMUTools';
     const BUFF_PREFIX = 'RMU Buff [';
@@ -73,6 +73,15 @@ var RMUTools = RMUTools || (function () {
         mentalism:  'rr_mentalism_misc',
         physical:   'rr_physical_misc',
         fear:       'rr_fear_misc'
+    };
+    // Mirrors the official RMU sheet's RR definitions.
+    const RR_DEFS = {
+        arcane:     { stat: 'em/in/pr', label: 'Arcane' },
+        channeling: { stat: 'in',       label: 'Channeling' },
+        essence:    { stat: 'em',       label: 'Essence' },
+        mentalism:  { stat: 'pr',       label: 'Mentalism' },
+        physical:   { stat: 'co',       label: 'Physical' },
+        fear:       { stat: 'sd',       label: 'Fear' }
     };
 
     const POWER_LEVELS = {
@@ -112,10 +121,9 @@ var RMUTools = RMUTools || (function () {
     function whisperPlayer(msg, body) {
         const player = getObj('player', msg.playerid);
         const target = player ? player.get('_displayname') : 'gm';
-
         sendChat(
             SCRIPT,
-            `/w "${target.replace(/"/g, '')}" ${body}`,
+            `/w "${String(target).replace(/"/g, '')}" ${body}`,
             null,
             { noarchive: true }
         );
@@ -223,6 +231,58 @@ var RMUTools = RMUTools || (function () {
         return total;
     }
 
+    function isOwnRealmForRR(rrName, characterRealm) {
+        const realm = String(characterRealm || '')
+            .toLowerCase()
+            .replace(/[^a-z]/g, '');
+
+        if (!realm) return false;
+        if (rrName === 'arcane') return realm === 'arcane';
+
+        // Handles both single realms and hybrid names such as
+        // "Channeling/Essence".
+        return realm.indexOf(rrName) !== -1;
+    }
+
+    function recalcResistanceRolls(charId) {
+        const level = parseInt(getAttr(charId, 'level', 0), 10) || 0;
+        const characterRealm = getAttr(charId, 'realm', '');
+        const updates = {};
+
+        Object.keys(RR_DEFS).forEach(rrName => {
+            const def = RR_DEFS[rrName];
+            const stats = def.stat.split('/');
+
+            // Mirrors the official RMU sheet: for multi-stat RRs, use the
+            // best current realm-stat bonus.
+            let statBonus = -1000;
+            const statLines = [];
+            stats.forEach(stat => {
+                const value = parseInt(getAttr(charId, stat, 0), 10) || 0;
+                if (value > statBonus) statBonus = value;
+                statLines.push(`${value} ${stat.toUpperCase()} Bonus`);
+            });
+            if (statBonus === -1000) statBonus = 0;
+
+            const miscAttr = RR_ATTRS[rrName];
+            const misc = miscTotal(getAttr(charId, miscAttr, '[]'));
+            const ownRealm = isOwnRealmForRR(rrName, characterRealm) ? 10 : 0;
+            const bonus = statBonus + misc + (level * 2) + ownRealm;
+
+            updates[`rr_${rrName}_bonus`] = bonus;
+            updates[`rr_${rrName}_info`] =
+                `${statBonus} Realm Stat Bonus\n` +
+                `${misc} Miscellaneous\n` +
+                `${level * 2} Twice Level\n` +
+                `${ownRealm} Own Realm\n` +
+                statLines.join('\n');
+        });
+
+        Object.keys(updates).forEach(attr => {
+            setAttr(charId, attr, updates[attr], false);
+        });
+    }
+
     function cleanTargetText(s) {
         return String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
     }
@@ -287,6 +347,14 @@ var RMUTools = RMUTools || (function () {
             (activeByAttr[attr] || []).forEach(e => arr.push({ name: e.name, value: e.value }));
             setAttr(charId, attr, JSON.stringify(arr), true);
         });
+
+        // The official RMU sheet does not watch rr_*_misc for changes.
+        // Recalculate the displayed/rolled RR bonuses ourselves whenever
+        // this Mod manages any RR misc attribute.
+        if (cs.managedAttrs.some(attr =>
+            /^rr_(arcane|channeling|essence|mentalism|physical|fear)_misc$/.test(attr))) {
+            recalcResistanceRolls(charId);
+        }
     }
 
     function buffMenu(msg, character) {
